@@ -1,0 +1,67 @@
+import os
+import requests
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Загружаем переменные окружения
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+# --- Поиск видео на YouTube ---
+def search_youtube(query):
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "q": query,
+        "key": YOUTUBE_API_KEY,
+        "maxResults": 3,
+        "type": "video"
+    }
+
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    if "items" not in data:
+        return None
+
+    results = []
+    for item in data["items"]:
+        video_id = item["id"]["videoId"]
+        title = item["snippet"]["title"]
+        link = f"https://www.youtube.com/watch?v={video_id}"
+        results.append(f"{title}\n{link}")
+
+    return results if results else None
+
+
+# --- Обработчики Telegram ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Привет! Я SoundScout бот. Напиши название песни — я помогу найти её на YouTube!")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text.strip()
+    results = search_youtube(query)
+
+    if not results:
+        await update.message.reply_text("Не удалось получить результаты с YouTube — попробуй позже.")
+    else:
+        reply = "\n\n".join(results)
+        await update.message.reply_text(f"🎵 Нашёл для тебя:\n\n{reply}")
+
+
+# --- Главная функция ---
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("✅ SoundScout запущен (YouTube search parser)...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
