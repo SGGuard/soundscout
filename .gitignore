@@ -1,22 +1,22 @@
-# --- Виртуальное окружение ---
+# --- Virtual environment ---
 venv/
 .venv/
 
-# --- Конфигурационные файлы ---
+# --- Environment and config files ---
 .env
 
-# --- Скачанные файлы и кеш ---
+# --- Downloaded files and cache ---
 downloads/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# --- Системные каталоги и IDE ---
+# --- System folders and IDE settings ---
 .vscode/
 .idea/
 .DS_Store
 
-# --- Логи ---
+# --- Logs ---
 *.log
 logs/
