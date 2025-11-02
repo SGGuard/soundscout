@@ -1,0 +1,5 @@
+/project-folder/
+├── bot.py
+├── requirements.txt
+├── .env
+└── cache/
