@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 """
-SoundScout v4.2
+SoundScout v4.4
 - Telegram бот для скачивания треков с YouTube в MP3
 - Кэширование и повторная отправка без повторного скачивания
-- Корректные имена файлов и метаданные (UTF-8)
 - Поддержка .env для токенов и API-ключей
-- Логирование и ограничение размера файлов
+- Логирование, стабильность и улучшенный поиск
 """
 
 import os
@@ -16,9 +14,10 @@ import shutil
 import logging
 from pathlib import Path
 from typing import Optional
-from dotenv import load_dotenv  # ✅ подключаем dotenv
+from dotenv import load_dotenv
 
 import yt_dlp
+import requests
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,19 +30,16 @@ from telegram.request import HTTPXRequest
 
 
 # ================== CONFIG ==================
-# Загружаем переменные окружения из .env
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-GENIUS_TOKEN = os.getenv("GENIUS_TOKEN")
-
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN не найден. Укажи его в .env")
-
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+if not BOT_TOKEN:
+    raise SystemExit("❌ BOT_TOKEN не найден. Укажи его в .env")
 
 MAX_MB = 45
 MAX_BYTES = MAX_MB * 1024 * 1024
@@ -58,15 +54,11 @@ log = logging.getLogger("SoundScout")
 
 # ================== HELPERS ==================
 def normalize(q: str) -> str:
-    q = re.sub(r"\s+", " ", q.strip().lower())
-    q = "".join(c for c in q if c.isalnum() or c in (" ", "-", "_"))
-    return q
+    return re.sub(r"\s+", " ", q.strip().lower())
 
 
 def sanitize_filename(name: str) -> str:
-    """Очищает имя файла от недопустимых символов и кодирует в UTF-8"""
     name = re.sub(r'[\\/*?:"<>|]', "", name)
-    name = name.encode("utf-8", errors="ignore").decode("utf-8")
     return name.strip()
 
 
@@ -75,18 +67,70 @@ def cache_path(query: str) -> Path:
     return CACHE_DIR / f"{h}.mp3"
 
 
-def cleanup(p: Path):
+# ================== CORE ==================
+def search_youtube(query: str) -> Optional[dict]:
+    """Ищет видео на YouTube и возвращает {title, link}"""
+    if not YOUTUBE_API_KEY:
+        log.warning("⚠️ Нет YOUTUBE_API_KEY, поиск может быть ограничен")
+        return None
+
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "q": query,
+        "key": YOUTUBE_API_KEY,
+        "maxResults": 1,
+        "type": "video",
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    if "items" not in data or not data["items"]:
+        return None
+
+    item = data["items"][0]
+    return {
+        "title": item["snippet"]["title"],
+        "link": f"https://www.youtube.com/watch?v={item['id']['videoId']}",
+    }
+
+
+async def download_track(url: str, query: str) -> Optional[Path]:
+    """Скачивает трек с YouTube в MP3"""
+    tmp = Path(tempfile.mkdtemp(prefix="snd_"))
     try:
-        shutil.rmtree(p)
-    except Exception:
-        pass
+        outtmpl = str(tmp / "%(title)s.%(ext)s")
+        ydl_opts = {
+            "quiet": True,
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            base, _ = os.path.splitext(filename)
+            mp3_path = Path(f"{base}.mp3")
+
+        if mp3_path.exists():
+            final = cache_path(query)
+            shutil.move(mp3_path, final)
+            return final
+    except Exception as e:
+        log.error(f"Ошибка загрузки: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return None
 
 
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎧 SoundScout v4.2\n"
-        "Отправь название трека, и я пришлю MP3 прямо сюда.\n"
+        "🎧 SoundScout v4.4\n"
+        "Отправь название трека — я пришлю MP3 прямо сюда.\n"
         f"Максимальный размер: {MAX_MB} MB."
     )
 
@@ -97,149 +141,55 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"📁 Кэш: {len(files)} файлов\n"
         f"💾 Размер: {total_size:.1f} MB\n"
-        f"📦 Путь: {CACHE_DIR}\n"
-        f"🔊 yt-dlp: {yt_dlp.__version__}"
+        f"📦 Путь: {CACHE_DIR}"
     )
     await update.message.reply_text(msg)
 
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает статистику по скачанным трекам"""
-    files = list(CACHE_DIR.glob("*.mp3"))
-    total_size = sum(f.stat().st_size for f in files)
-    await update.message.reply_text(
-        f"📊 Статистика:\n"
-        f"Файлов в кэше: {len(files)}\n"
-        f"Общий размер: {total_size / 1024 / 1024:.1f} MB"
-    )
-
-
-# ================== CORE ==================
-async def download_track(query: str) -> Optional[Path]:
-    """Ищет и скачивает трек, возвращает путь к MP3"""
-    tmp = Path(tempfile.mkdtemp(prefix="snd_"))
-    try:
-        log.info(f"Ищу: {query}")
-
-        # Поиск YouTube
-        ydl_opts_search = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio/best",
-            "default_search": "ytsearch5",
-            "skip_download": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts_search) as ydl:
-            res = ydl.extract_info(query, download=False)
-        entries = res.get("entries", [res])
-        if not entries:
-            return None
-
-        # Выбираем лучший результат
-        best = sorted(
-            entries,
-            key=lambda e: (e.get("view_count") or 0) - abs((e.get("duration") or 0) - 180),
-            reverse=True,
-        )[0]
-
-        url = best["webpage_url"]
-        title = sanitize_filename(best.get("title", "track"))
-        artist = sanitize_filename(best.get("uploader", "Unknown"))
-
-        log.info(f"Нашёл: {title} | {url}")
-
-        # Скачивание и конвертация
-        outtmpl = str(tmp / "%(title)s.%(ext)s")
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio/best",
-            "noplaylist": True,
-            "outtmpl": outtmpl,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        mp3s = list(tmp.glob("*.mp3"))
-        if not mp3s:
-            return None
-
-        mp3 = mp3s[0]
-        size = mp3.stat().st_size
-        if size > MAX_BYTES:
-            log.warning(f"Файл слишком большой: {size / 1024 / 1024:.1f} MB")
-            return None
-
-        # Переименование и сохранение
-        final_name = f"{title}.mp3"
-        final_path = cache_path(query)
-        final_human = final_path.with_name(final_name)
-        shutil.move(str(mp3), str(final_human))
-        cleanup(tmp)
-        log.info(f"Готово: {final_human}")
-        return final_human
-
-    except Exception as e:
-        log.error(f"Ошибка при скачивании: {e}")
-        cleanup(tmp)
-        return None
-
-
-# ================== MESSAGE HANDLER ==================
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = (update.message.text or "").strip()
     if not query:
-        await update.message.reply_text("❌ Введите название трека.")
+        await update.message.reply_text("⚠️ Введи название трека.")
         return
 
-    cache_file = cache_path(query)
-    if cache_file.exists():
-        log.info(f"Кэш найден: {cache_file.name}")
-        title = sanitize_filename(cache_file.stem)
+    cached = cache_path(query)
+    if cached.exists():
+        log.info(f"Кэш найден: {cached.name}")
         await update.message.reply_audio(
-            audio=open(cache_file, "rb"),
-            caption=f"🎵 {title}",
-            title=title,
-            performer="SoundScout",
+            audio=open(cached, "rb"),
+            caption=f"🎶 {cached.stem}",
         )
         return
 
-    await update.message.reply_text(f"🔍 Шуршу в недрах: {query}")
-    mp3 = await download_track(query)
-
-    if not mp3 or not mp3.exists():
-        await update.message.reply_text("❌ Не удалось найти трек.")
+    await update.message.reply_text("🔎 Ищу трек...")
+    video = search_youtube(query)
+    if not video:
+        await update.message.reply_text("❌ Не удалось найти трек на YouTube.")
         return
 
-    title = sanitize_filename(mp3.stem)
+    await update.message.reply_text(f"🎶 Нашёл: {video['title']}\n⏳ Загружаю аудио...")
+    mp3 = await download_track(video["link"], query)
+
+    if not mp3 or not mp3.exists():
+        await update.message.reply_text("⚠️ Ошибка при загрузке. Попробуй другой трек.")
+        return
+
     await update.message.reply_audio(
         audio=open(mp3, "rb"),
-        caption=f"🎶 {title}",
-        title=title,
-        performer="SoundScout",
+        caption=f"🎵 {video['title']}",
     )
     log.info(f"Отправлен: {mp3.name}")
 
 
 # ================== MAIN ==================
 def main():
-    log.info("🚀 SoundScout v4.2 запущен")
+    log.info("🚀 SoundScout v4.4 запущен")
 
     req = HTTPXRequest(connect_timeout=30, read_timeout=120)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", info))
-    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_query))
 
     app.run_polling()
